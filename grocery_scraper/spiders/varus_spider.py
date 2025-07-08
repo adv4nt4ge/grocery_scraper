@@ -23,8 +23,8 @@ class VarusSpider(BaseGrocerySpider):
     # Use Playwright for JavaScript rendering
     use_playwright = True
 
-    # Varus-specific selectors
-    category_selectors = '.a-megamenu-item--main a'
+    # Varus-specific selectors - only main categories
+    category_selectors = '.a-megamenu-item.a-megamenu-item--main.a-megamenu-item--has-child > a'
     product_card_selector = ['.sf-product-card', '.sf-product-card sf-product-card--out-of-stock-container']
     product_title_selector = '.sf-product-card__title'
     product_price_selectors = ['.sf-price__regular', '.sf-price__special']
@@ -112,9 +112,26 @@ class VarusSpider(BaseGrocerySpider):
             )
             return
 
-        # If no arguments provided, parse all categories from database
-        self.logger.info("No specific category provided, loading all categories from database")
-        yield from self.parse_all_categories_from_db()
+        # If discover_categories flag is set, discover categories
+        if self.discover_categories_mode:
+            self.logger.info("Category discovery mode enabled")
+            # Varus needs a custom request with Playwright to load categories
+            yield self.make_request(
+                self.start_urls[0],
+                callback=self.discover_categories_with_js,
+                meta={'page': 1}
+            )
+            return
+
+        # Otherwise, check if we should load from DB or discover
+        categories_exist = self.check_categories_in_db()
+        
+        if categories_exist:
+            self.logger.info("Loading categories from database")
+            yield from self.parse_all_categories_from_db()
+        else:
+            self.logger.info("No categories in database, starting category discovery")
+            yield from self.discover_categories(response)
 
     def parse_all_categories_from_db(self):
         """Parse all categories stored in database."""
@@ -133,19 +150,72 @@ class VarusSpider(BaseGrocerySpider):
 
             self.logger.info(f"Found {len(categories)} categories in database")
 
+            excluded_count = 0
             for category_name, category_url in categories:
+                # Check if URL should be excluded
+                if self.is_category_excluded(category_name, None, category_url):
+                    excluded_count += 1
+                    continue
+                    
                 self.logger.info(f"Queuing category: {category_name} -> {category_url}")
                 yield self.make_request(
                     category_url,
                     callback=self.parse_category,
                     meta={'category_name': category_name, 'page': 1}
                 )
+            
+            if excluded_count > 0:
+                self.logger.info(f"[VARUS] Excluded {excluded_count} categories based on URL filters")
 
         except Exception as e:
             self.logger.error(f"Error loading categories from database: {e}")
             self.logger.info("No categories found in database. Run category discovery first.")
         finally:
             conn.close()
+
+    def discover_categories_with_js(self, response: Response):
+        """Discover categories from Varus using JavaScript rendering."""
+        self.logger.info("[VARUS] Starting category discovery with JavaScript rendering")
+        
+        # Clear existing categories first
+        self.clear_categories_for_store()
+        
+        # Extract category elements to get both links and names
+        category_elements = response.css(self.category_selectors)
+        self.logger.info(f"[VARUS] Found {len(category_elements)} category elements")
+        
+        saved_count = 0
+        skipped_count = 0
+        for element in category_elements:
+            category_url = element.css('::attr(href)').get()
+            category_name = element.css('::text').get()
+            
+            if category_url and category_url.startswith('/') and category_name:
+                full_url = urljoin(response.url, category_url)
+                
+                # Clean and use the actual category name from the link text
+                category_name = self.clean_text(category_name)
+                
+                # Check if URL should be excluded
+                if self.is_category_excluded(category_name, None, full_url):
+                    skipped_count += 1
+                    continue
+                
+                # Save to database
+                if self.save_category_to_db(category_name, full_url):
+                    saved_count += 1
+        
+        self.logger.info(f"[VARUS] Category discovery complete. Saved {saved_count} categories to database")
+        if skipped_count > 0:
+            self.logger.info(f"[VARUS] Skipped {skipped_count} categories based on URL filters")
+        self.logger.info(f"[VARUS] Run spider again without discover_categories flag to parse products")
+        
+        # Close Playwright page if included
+        page_obj = response.meta.get('playwright_page')
+        if page_obj:
+            import asyncio
+            asyncio.create_task(page_obj.close())
+            self.logger.debug(f"[VARUS] Scheduled page close for {response.url}")
 
     def parse_category(self, response: Response):
         """Parse category page and extract products."""

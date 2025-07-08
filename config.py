@@ -13,7 +13,7 @@ STORES = {
         "use_playwright": True,
     },
     "silpo": {
-        "name": "Silpo", 
+        "name": "Silpo",
         "base_url": "https://silpo.ua",
         "use_playwright": True,
     },
@@ -58,8 +58,33 @@ BLOCKED_RESOURCES = [
 # Browser settings
 BROWSER_ARGS = [
     "--disable-images",
-    "--disable-javascript-images", 
+    "--disable-javascript-images",
     "--disable-gpu",
     "--no-sandbox",
     "--disable-dev-shm-usage",
 ]
+
+# URL patterns to exclude - store-specific
+EXCLUDED_URL_PATTERNS = {
+    "varus": [
+        "varuscafe"
+    ],
+
+    "silpo": [
+        "spetsialni-propozytsii-5189",
+        "lavka-tradytsii-4487",
+        "vlasni-marky-5202",
+        "spetsialni-propozytsii-5189",
+        "avtorski-alkogolni-napoi-4496",
+        "gotovi-stravy-i-kulinariia-4761",
+        "zdorove-kharchuvannia-4864"
+    ],
+
+    "atb": [
+        # Add ATB-specific URL patterns to exclude
+    ],
+
+    "metro": [
+        # Add Metro-specific URL patterns to exclude
+    ],
+}

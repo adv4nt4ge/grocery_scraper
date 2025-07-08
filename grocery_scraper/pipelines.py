@@ -76,11 +76,6 @@ def calculate_discount_percentage(original, current):
     return ((original - current) / original) * 100
 
 
-def calculate_unit_price(price, quantity, unit):
-    """Calculate unit price."""
-    if not price or not quantity:
-        return None
-    return price / quantity
 
 
 # Simple database class
@@ -156,8 +151,7 @@ class SimpleDB:
 # Product class
 class Product:
     def __init__(self, name, price, category, subcategory, store, url, 
-                 image_url=None, sku=None, brand=None, description=None,
-                 unit=None, quantity=None, status="available", scraped_at=None):
+                 image_url=None, brand=None, description=None, scraped_at=None):
         self.name = name
         self.price = price
         self.category = category
@@ -165,22 +159,9 @@ class Product:
         self.store = store
         self.url = url
         self.image_url = image_url
-        self.sku = sku
         self.brand = brand
         self.description = description
-        self.unit = unit
-        self.quantity = quantity
-        self.status = status
         self.scraped_at = scraped_at or datetime.now()
-
-
-# Product status enum
-class ProductStatus:
-    AVAILABLE = "available"
-    OUT_OF_STOCK = "out_of_stock"
-    DISCONTINUED = "discontinued"
-    UNKNOWN = "unknown"
-
 
 # Global database instance
 db = SimpleDB()
@@ -264,22 +245,6 @@ class ValidationPipeline:
                         raise ValueError(f"Invalid URL: {adapter[field]}")
                     adapter[field] = None
         
-        # Calculate unit price if possible
-        if adapter.get('price') and adapter.get('quantity') and adapter.get('unit'):
-            unit_price = calculate_unit_price(
-                adapter['price'], adapter['quantity'], adapter['unit']
-            )
-            if unit_price:
-                adapter['unit_price'] = unit_price
-        
-        # Validate status
-        if adapter.get('status'):
-            valid_statuses = [ProductStatus.AVAILABLE, ProductStatus.OUT_OF_STOCK, 
-                            ProductStatus.DISCONTINUED, ProductStatus.UNKNOWN]
-            if adapter['status'] not in valid_statuses:
-                adapter['status'] = ProductStatus.AVAILABLE
-        else:
-            adapter['status'] = ProductStatus.AVAILABLE
 
 
 class DeduplicationPipeline:
@@ -391,18 +356,14 @@ class DatabasePipeline:
             store=adapter.get('store'),
             url=adapter.get('url'),
             image_url=adapter.get('image_url'),
-            sku=adapter.get('sku'),
             brand=adapter.get('brand'),
             description=adapter.get('description'),
-            unit=adapter.get('unit'),
-            quantity=adapter.get('quantity'),
-            status=adapter.get('status', ProductStatus.AVAILABLE),
             scraped_at=adapter.get('scraped_at', datetime.now())
         )
 
 
 class CategoryPipeline:
-    """Pipeline for storing discovered categories to database."""
+    """Pipeline for processing category items only."""
     
     def __init__(self):
         self.categories_saved = 0
@@ -432,17 +393,8 @@ class CategoryPipeline:
             # Don't pass category items to other pipelines
             raise DropItem("Category item processed")
         
-        # For regular product items, extract and save category info
-        store = adapter.get('store')
-        category = adapter.get('category')
-        subcategory = adapter.get('subcategory')
-        
-        if store and category:
-            try:
-                # Save category without URL (will be updated when category page is scraped)
-                db.insert_category(store, category, subcategory)
-            except Exception as e:
-                spider.logger.debug(f"Could not save category from product: {e}")
+        # For regular product items, category info is only saved to products table
+        # Do not save to categories table
         
         return item
     

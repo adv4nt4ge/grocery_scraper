@@ -30,8 +30,6 @@ def clean_price(price_text):
 def normalize_url(url):
     return url.strip() if url else url
 
-def parse_quantity_unit(text):
-    return None, None  # Simplified
 
 def validate_product_data(data):
     return True, []  # Simplified
@@ -60,10 +58,6 @@ def validate_store(value: str) -> str:
     return value
 
 
-def parse_quantity_and_unit(value: str) -> Dict[str, Optional[Union[str, float]]]:
-    """Parse quantity and unit from text."""
-    quantity, unit = parse_quantity_unit(value)
-    return {'quantity': quantity, 'unit': unit}
 
 
 class ProductItem(scrapy.Item):
@@ -79,7 +73,6 @@ class ProductItem(scrapy.Item):
     # Optional fields
     subcategory = scrapy.Field()
     image_url = scrapy.Field()
-    sku = scrapy.Field()
     brand = scrapy.Field()
     description = scrapy.Field()
     
@@ -88,13 +81,10 @@ class ProductItem(scrapy.Item):
     discount_percentage = scrapy.Field()
     discount_amount = scrapy.Field()
     
-    # Quantity and unit
-    unit = scrapy.Field()
-    quantity = scrapy.Field()
-    unit_price = scrapy.Field()  # Price per standard unit
+    # Price per standard unit
+    unit_price = scrapy.Field()
     
-    # Status and availability
-    status = scrapy.Field()  # available, out_of_stock, discontinued
+    # Availability
     availability = scrapy.Field()
     stock_quantity = scrapy.Field()
     
@@ -161,22 +151,6 @@ class ProductItemLoader(ItemLoader):
     description_in = MapCompose(lambda x: clean_text(x, preserve_newlines=True))
     description_out = TakeFirst()
     
-    # Quantity processing
-    def parse_quantity_field(self, values):
-        """Parse quantity and unit from product text."""
-        if not values:
-            return None
-        
-        text = ' '.join(str(v) for v in values if v)
-        quantity, unit = parse_quantity_unit(text)
-        
-        # Set both quantity and unit
-        if quantity is not None:
-            self.add_value('quantity', quantity)
-        if unit is not None:
-            self.add_value('unit', unit)
-        
-        return text
     
     # Date processing
     scraped_at_in = MapCompose(lambda x: x if isinstance(x, datetime) else datetime.now())

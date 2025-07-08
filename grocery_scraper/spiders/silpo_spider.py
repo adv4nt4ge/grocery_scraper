@@ -1,245 +1,239 @@
-import scrapy
-from scrapy.http import Request
-from scrapy_playwright.page import PageMethod
-from .base_spider import BaseGrocerySpider
+#!/usr/bin/env python3
+"""
+Silpo spider with store-specific logic and selectors.
+"""
+
+from typing import Any, Optional, Union
 from urllib.parse import urljoin, quote
 import re
-from datetime import datetime
-from typing import Any
+
+from scrapy.http import Response
+from scrapy_playwright.page import PageMethod
+
+from .base_spider import BaseGrocerySpider
+from ..utils import init_page_with_blocking
 
 
-class SilpoSpider(scrapy.Spider):
-    name = "silpo"
-    allowed_domains = ["silpo.ua"]
-    base_url = "https://silpo.ua"
-    
-    
-    def __init__(self, product_name=None, start_url=None, *args, **kwargs):
-        super(SilpoSpider, self).__init__(*args, **kwargs)
-        self.product_name = product_name
+class SilpoSpider(BaseGrocerySpider):
+    """Spider for Silpo grocery store."""
+
+    name = 'silpo'
+    store_name = 'Silpo'
+    allowed_domains = ['silpo.ua']
+    start_urls = ['https://silpo.ua']
+
+    # Use Playwright for JavaScript rendering
+    use_playwright = True
+
+    # Silpo-specific selectors (preserved from original)
+    category_selectors = 'a[data-autotestid="ssr-menu-categories__link"]'
+    product_card_selector = ['[data-autotestid="shop-silpo-product-card"]', '.product-card-list__item', '.product-card']
+    product_title_selector = '.product-card__title'
+    product_price_selectors = '.product-card-price__displayPrice'
+    product_link_selector = '.product-card a, a'
+    pagination_selector = '.pagination'
+
+    # Breadcrumb settings - target the link inside, not the whole li element
+    breadcrumb_selector = '.breadcrumbs-list__item breadcrumbs-list__item--active ng-star-inserted a'
+
+    def __init__(self, category_name=None, start_url=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.category_name = category_name
         self.start_url = start_url
-        self.processed_categories = set()  # Track processed categories to avoid duplicates
-        self.requested_categories = set()  # Track requested category URLs
-        self.failed_urls = set()  # Track URLs that failed after all retries
-    
-    
-    @staticmethod
-    def get_page_methods(fast_mode=False):
-        """Get optimized page methods for fast loading"""
-        if fast_mode:
-            # Minimal page methods for problematic pages and retries
-            return [
+
+        # If specific URL provided, use it
+        if start_url:
+            self.start_urls = [start_url]
+        # If category name provided, look it up in database
+        elif category_name:
+            category_url = self.get_category_url_from_db(category_name)
+            if category_url:
+                self.start_urls = [category_url]
+                self.start_url = category_url
+                self.logger.info(f"Found category URL in database: {category_url}")
+            else:
+                self.logger.warning(f"Category '{category_name}' not found in database")
+
+    def get_category_url_from_db(self, category_name):
+        """Get category URL from database by name."""
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                           SELECT category_url
+                           FROM categories
+                           WHERE store = ?
+                             AND category LIKE ?
+                           ''', (self.store_name, f'%{category_name}%'))
+            result = cursor.fetchone()
+            return result[0] if result else None
+        except Exception as e:
+            self.logger.error(f"Error querying database: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def make_request(self, url: str, callback=None, meta=None, **kwargs):
+        """Create request with Silpo-specific Playwright settings."""
+        self.logger.info(f"[SILPO] Creating custom request for: {url}")
+        request_meta = meta or {}
+
+        # Add Playwright settings if enabled
+        if self.use_playwright:
+            request_meta['playwright'] = True
+            request_meta['playwright_include_page'] = True
+            # Use custom page initialization with resource blocking
+            request_meta['playwright_page_init_callback'] = init_page_with_blocking
+            # Wait for products to load
+            request_meta['playwright_page_methods'] = [
                 PageMethod('wait_for_load_state', 'domcontentloaded'),
-                PageMethod('wait_for_timeout', 500),  # Faster wait
+                PageMethod('wait_for_timeout', 300),
                 PageMethod('wait_for_function',
                            '''() => {
-                               // Quick check if content loaded or page ready
+                               // Quick check if essential content loaded
                                const hasProducts = document.querySelector('[data-autotestid="shop-silpo-product-card"]') !== null;
                                const hasCategories = document.querySelector('[data-autotestid="menu-categories__link"]') !== null;
                                const hasContent = document.body.innerText.length > 100;
-                               return hasProducts || hasCategories || hasContent || document.readyState === 'complete';
-                           }''', timeout=4000),  # Faster timeout
+                               const isEmpty = document.querySelector('.empty-results') !== null;
+                               return hasProducts || hasCategories || hasContent || isEmpty || document.readyState === 'complete';
+                           }''', timeout=5000),
             ]
 
-        return [
-            PageMethod('wait_for_load_state', 'domcontentloaded'),
-            PageMethod('wait_for_timeout', 300),  # Faster wait
-            PageMethod('wait_for_function',
-                       '''() => {
-                           // Quick check if essential content loaded
-                           const hasProducts = document.querySelector('[data-autotestid="shop-silpo-product-card"]') !== null;
-                           const hasCategories = document.querySelector('[data-autotestid="menu-categories__link"]') !== null;
-                           const hasContent = document.body.innerText.length > 100;
-                           const isEmpty = document.querySelector('.empty-results') !== null;
-                           return hasProducts || hasCategories || hasContent || isEmpty || document.readyState === 'complete';
-                       }''', timeout=5000),  # Balanced timeout
-        ]
+        # Add errback to ensure page cleanup
+        return super().make_request(url, callback, request_meta, errback=self.close_page_on_error, **kwargs)
 
-    async def start(self):
-        """New async start method for Scrapy 2.13+"""
-        for request in self.start_requests():
-            yield request
+    async def close_page_on_error(self, failure):
+        """Close Playwright page on request failure."""
+        page = failure.request.meta.get('playwright_page')
+        if page:
+            await page.close()
+            self.logger.info(f"[SILPO] Closed page due to error: {failure.value}")
 
-    def start_requests(self):
-        if self.start_url:
-            # Direct URL for testing
-            yield Request(
-                self.start_url,
-                callback=self.parse_search_results,
-                meta={
-                    'playwright': True,
-                    'playwright_wait_for_timeout': 12000,  # Optimized timeout
-                    'playwright_page_methods': self.get_page_methods()
-                },
-                errback=self.errback
-            )
-        elif self.product_name:
-            # Try updated search URL patterns based on site structure
-            search_patterns = [
-                f'/search?q={quote(self.product_name)}',
-                f'/ua/search?q={quote(self.product_name)}',
-            ]
-
-            for pattern in search_patterns:
-                url = urljoin(self.base_url, pattern)
-                yield Request(
-                    url,
-                    callback=self.parse_search_results,
-                    meta={
-                        'search_url': url,
-                        'playwright': True,
-                        'playwright_wait_for_timeout': 12000,  # Optimized timeout
-                        'playwright_page_methods': self.get_page_methods()
-                    },
-                    errback=self.errback
+    def parse(self, response: Response):
+        """Parse main page and discover categories."""
+        # If we have a specific category name, only scrape that category
+        if self.category_name:
+            self.logger.info(f"Scraping specific category: {self.category_name}")
+            # If we have a direct category URL, parse it directly
+            if self.start_url and self.start_url != response.url:
+                yield self.make_request(
+                    self.start_url,
+                    callback=self.parse_category,
+                    meta={'category_name': self.category_name, 'page': 1}
                 )
+                return
+            else:
+                # Try to parse the current page as a category page
+                yield from self.parse_category(response)
+                return
+
+        # If discover_categories flag is set, always discover categories
+        if self.discover_categories_mode:
+            self.logger.info("Category discovery mode enabled")
+            yield from self.discover_categories(response)
+            return
+
+        # Otherwise, check if we should load from DB or discover
+        categories_exist = self.check_categories_in_db()
+
+        if categories_exist:
+            self.logger.info("Loading categories from database")
+            yield from self.parse_all_categories_from_db()
         else:
-            # Get all categories
-            yield Request(
-                self.base_url,
-                callback=self.parse_categories,
-                meta={
-                    'playwright': True,
-                    'playwright_wait_for_timeout': 20000,  # Fast timeout
-                    'playwright_page_methods': [
-                        PageMethod('wait_for_load_state', 'domcontentloaded'),
-                        PageMethod('wait_for_timeout', 4000),
-                        PageMethod('click', '[data-autotestid="shop-silpo-category-menu-button"]'),
-                        PageMethod('wait_for_timeout', 1000),
-                    ]
-                }
-            )
-    
-    def parse_search_results(self, response):
-        self.logger.info(f"Parsing search results from {response.url}")
+            self.logger.info("No categories in database, starting category discovery")
+            yield from self.discover_categories(response)
 
-        # Check response status and content type
-        if response.status != 200:
-            self.logger.warning(f"Non-200 response ({response.status}) from {response.url}")
-            return
+    def parse_category(self, response: Response):
+        """Parse category page and extract products."""
+        category_name = response.meta.get('category_name') or self.category_name or 'Unknown'
+        page = response.meta.get('page', 1)
 
-        # Check if response is text-based
-        content_type = response.headers.get('content-type', b'').decode('utf-8')
-        if 'text/html' not in content_type:
-            self.logger.warning(f"Non-HTML response from {response.url}, content-type: {content_type}")
-            return
+        self.logger.info(f"[SILPO] Parsing category: {category_name} (page {page})")
+        self.logger.info(f"[SILPO] Response URL: {response.url}")
+        self.logger.info(f"[SILPO] Response status: {response.status}")
+        self.logger.info(f"[SILPO] Response size: {len(response.text)} chars")
 
-        # Extract category information
-        category_info = self.extract_category_info(response)
+        # Extract products using multiple CSS selectors
+        product_cards = []
+        for selector in self.product_card_selector:
+            cards = response.css(selector)
+            product_cards.extend(cards)
+            self.logger.info(f"[SILPO] Found {len(cards)} cards with selector: {selector}")
 
-        try:
-            # Check if we have products - using Silpo specific selectors
-            products_container = response.css('.product-card-list')
-            if products_container:
-                # Look for products within the container
-                products = products_container.xpath("//shop-silpo-common-product-card[@data-autotestid='shop-silpo-product-card']")
-            else:
-                # Fallback: look for products globally
-                products = response.xpath("//shop-silpo-common-product-card[@data-autotestid='shop-silpo-product-card']")
+        products_found = 0
+        self.logger.info(f"[SILPO] Total product cards found: {len(product_cards)}")
 
-            if not products:
-                # Try CSS selectors
-                products = response.css('[data-autotestid="shop-silpo-product-card"]')
+        for card in product_cards:
+            product = self.extract_product(card, response, category_name)
+            if product:
+                self.save_product(product)
+                yield product
+                products_found += 1
 
-            if not products:
-                # Try alternative selectors
-                products = response.css('.product-card-list__item, .product-card')
+        self.logger.info(f"[SILPO] Found {products_found} products on page {page}")
 
-        except (AttributeError, ValueError, TypeError) as e:
-            self.logger.error(f"Error parsing CSS selectors from {response.url}: {e}")
-            return
+        # Close Playwright page if included
+        page_obj = response.meta.get('playwright_page')
+        if page_obj:
+            import asyncio
+            asyncio.create_task(page_obj.close())
+            self.logger.debug(f"[SILPO] Scheduled page close for {response.url}")
 
-        if not products:
-            return
+        # Handle pagination if on first page
+        if page == 1:
+            yield from self.handle_pagination(response, category_name)
 
-        # Track seen products to avoid duplicates
-        seen_products = set()
+    def extract_product(self, card, response: Response, category_name: str) -> Optional[
+        dict[str, Union[Union[str, float, None], Any]]]:
+        """Extract product data from product card."""
+        # Product name
+        name = card.css(f'{self.product_title_selector}::text').get()
+        name = self.clean_text(name)
 
-        for product in products:
-            item = ProductItem()
+        # Product price
+        price_text = card.css(f'{self.product_price_selectors}::text').get()
+        price = self.clean_price(price_text)
 
-            # Extract product name - using Silpo specific selectors
-            name = product.css('.product-card__title::text').get()
-            if not name:
-                # Try aria-label
-                aria_label = product.css('::attr(aria-label)').get()
-                if aria_label:
-                    name_match = re.search(r'товар\s+([^,]+)', aria_label, re.I)
-                    if name_match:
-                        name = name_match.group(1).strip()
+        if not price:
+            return None
 
-            if not name:
-                continue
+        # Product URL
+        product_url = card.css(f'{self.product_link_selector}::attr(href)').get()
+        if product_url:
+            product_url = urljoin(response.url, product_url)
 
-            item['name'] = name.strip()
+        # Extract image URL
+        image_url = card.css('[data-autotestid="img"]::attr(src)').get()
+        if not image_url:
+            image_url = card.css('img::attr(src)').get()
+        if image_url:
+            image_url = urljoin(response.url, image_url)
 
-            # Create unique identifier for deduplication
-            product_url = product.css('.product-card a::attr(href), a::attr(href)').get()
+        # Extract category and subcategory from breadcrumbs if available
+        category, subcategory = self.extract_category_from_breadcrumbs(response)
+        if not category:
+            category = category_name
 
-            # Use name + URL as unique key, fallback to just name if no URL
-            unique_key = f"{item['name']}|{product_url or ''}"
-            if unique_key in seen_products:
-                continue
-            seen_products.add(unique_key)
+        return {
+            'name': name,
+            'price': price,
+            'category': category,
+            'subcategory': subcategory,
+            'store': self.store_name,
+            'url': product_url,
+            'image_url': image_url,
+        }
 
-            # Extract price - using Silpo specific selectors
-            price_text = product.css('.product-card-price__displayPrice::text').get()
-            if not price_text:
-                # Try aria-label for price
-                aria_label = product.css('::attr(aria-label)').get()
-                if aria_label:
-                    price_match = re.search(r'ціна\s+([\d.,]+)', aria_label, re.I)
-                    if price_match:
-                        price_text = price_match.group(1)
-
-            if price_text:
-                extracted_price = self.extract_price(price_text)
-                if extracted_price:
-                    item['price'] = extracted_price
-                else:
-                    pass
-            else:
-                pass
-
-            # Set URLs
-            if product_url:
-                item['store_url'] = urljoin(self.base_url, product_url)
-
-            # Save the category URL where this product was found
-            item['url'] = response.url
-
-            # Extract image - using Silpo specific selector
-            image_url = product.css('[data-autotestid="img"]::attr(src)').get()
-            if not image_url:
-                image_url = product.css('img::attr(src)').get()
-
-            if image_url:
-                item['image_url'] = urljoin(self.base_url, image_url)
-
-            # Set store info
-            item['store'] = 'Silpo'
-            item['scraped_at'] = datetime.now().isoformat()
-
-            # Add category information
-            if category_info:
-                item['category'] = category_info.get('category')
-                item['subcategory'] = category_info.get('subcategory')
-
-            yield item
-
-        # Simple pagination - get last page number
-        current_page = response.meta.get('page_num', 1)
-
-        # Extract base URL without page parameter for tracking
-        base_url = response.url.split('?')[0]
-
-        # Get last page number from pagination
-        pag_block = response.css('.pagination')
+    def handle_pagination(self, response: Response, category_name: str):
+        """Handle pagination for Silpo categories."""
+        # Get pagination block
+        pag_block = response.css(self.pagination_selector)
 
         if pag_block:
             # Look for pagination items
             pagination_items = pag_block.css('.pagination-item.ng-star-inserted, .pagination-item')
-            
+
             if pagination_items:
                 # Extract page numbers
                 page_numbers = []
@@ -249,297 +243,22 @@ class SilpoSpider(scrapy.Spider):
                         page_text = item.css('::text').get()
                     if page_text and page_text.strip().isdigit():
                         page_numbers.append(int(page_text.strip()))
-                
+
                 if page_numbers:
                     last_page_num = max(page_numbers)
-                else:
-                    last_page_num = None
-            else:
-                last_page_num = None
-        else:
-            last_page_num = None
+                    self.logger.info(f"Found {last_page_num} total pages for {category_name}")
 
-        # If we found a last page number and this is page 1, generate all page URLs
-        if last_page_num and current_page == 1 and last_page_num > 1:
-            # Check if we already processed this category's pagination
-            if base_url in self.processed_categories:
-                return
+                    # Generate requests for remaining pages
+                    base_url = response.url.split('?')[0]
+                    for page_num in range(2, last_page_num + 1):
+                        if '?page=' in response.url:
+                            page_url = re.sub(r'page=\d+', f'page={page_num}', response.url)
+                        else:
+                            separator = '&' if '?' in response.url else '?'
+                            page_url = f"{response.url}{separator}page={page_num}"
 
-            self.processed_categories.add(base_url)
-            self.logger.info(f"Generating {last_page_num - 1} pagination requests for {base_url}")
-
-            # Generate all page URLs from 2 to last_page_num
-            for page_num in range(2, last_page_num + 1):
-                if '?page=' in response.url:
-                    page_url = re.sub(r'page=\d+', f'page={page_num}', response.url)
-                else:
-                    separator = '&' if '?' in response.url else '?'
-                    page_url = f"{response.url}{separator}page={page_num}"
-
-                yield Request(
-                    page_url,
-                    callback=self.parse_search_results,
-                    meta={
-                        'playwright': True,
-                        'playwright_wait_for_timeout': 12000,  # Optimized timeout
-                        'page_num': page_num,
-                        'playwright_page_methods': self.get_page_methods()
-                    }
-                )
-    
-    def parse_categories(self, response):
-        """Parse main page for category links"""
-        self.logger.info(f"Parsing categories from {response.url}")
-
-        # Single selector for category discovery - Silpo specific
-        categories = response.css('a[data-autotestid="menu-categories__link"]::attr(href)').getall()
-        self.logger.info(f"Found {len(categories)} category links with Silpo selector")
-        
-        if not categories:
-            # Try alternative selectors if main selector fails
-            alt_selectors = [
-                "//a[contains(@class, 'menu')]/@href",
-                "//div[contains(@class, 'catalog')]//a/@href",
-                "//nav//a/@href"
-            ]
-            for alt_xpath in alt_selectors:
-                alt_categories = response.xpath(alt_xpath).getall()
-                if alt_categories:
-                    categories.extend(alt_categories)
-                    break
-
-        # Deduplicate categories
-        categories = list(set(categories))
-        self.logger.info(f"Total unique category URLs: {len(categories)}")
-
-        # Filter for actual category URLs
-        category_count = 0
-        max_categories = 500  # Limit to prevent following too many URLs
-
-        for category_url in categories:
-            if not category_url:
-                continue
-
-            # Skip certain patterns that are not product categories
-            skip_patterns = [
-                'search', 'filter', 'sort', 'page=', '#', 'javascript:', 'mailto:', 'tel:',
-                'quiz', 'work', 'anti-corruption', 'promotion', 'contact', 'about',
-                'delivery', 'payment', 'help', 'news', 'blog', 'career', 'partnership',
-                'stores', 'shops', 'locations', 'map', 'branches', 'addresses',
-                'login', 'register', 'account', 'profile', 'cart', 'checkout',
-                'privacy', 'terms', 'conditions', 'policy', 'faq', 'support',
-                'novelty', 'new', 'sale', 'discount', 'action', 'special',
-                'business', 'biznes', 'shvydka-dostavka', 'dostavka-dlya', 'optom',
-                'wholesale', 'corporate', 'b2b', 'franchise', 'vacancy',
-                'gotovi-stravy-i-kulinariia', 'spetsialni-propozytsii'
-            ]
-            
-            # Skip individual product URLs
-            product_patterns = [
-                '-g', '-kg', '-ml', '-l', '-sm', '-250g', '-500g', '-1kg', '-100ml', '-250ml',
-                'product-', 'item-', '-z-', '-dlya-', '-na-', '-vid-', '-ta-', '-i-'
-            ]
-            
-            if any(skip in category_url for skip in skip_patterns):
-                continue
-                
-            # Additional check: skip if URL looks like a specific product
-            url_parts = category_url.lower().split('/')
-            is_product = False
-            for part in url_parts:
-                if any(pattern in part for pattern in product_patterns) and len(part) > 20:
-                    is_product = True
-                    break
-            
-            if is_product:
-                continue
-
-            # Check if it's a relative URL starting with /
-            if category_url.startswith('/') and len(category_url) > 1:
-                full_url = urljoin(self.base_url, category_url)
-
-                # Skip if it's the same as base URL or language switch
-                if full_url.rstrip('/') == self.base_url.rstrip('/'):
-                    continue
-                if category_url in ['/ua', '/uk', '/ru', '/en']:
-                    continue
-
-                # Skip if we already requested this category
-                if full_url in self.requested_categories:
-                    continue
-
-                self.requested_categories.add(full_url)
-                category_count += 1
-
-                # Limit the number of URLs to follow
-                if category_count > max_categories:
-                    break
-
-                # Check if this is a problematic page that needs fast mode
-                problematic_pages = [
-                    'ponchiki', 'zamorozhene-tisto', 'cukor', 'toniruyuschie-sredstva-dlya-volos',
-                    'optovi-zakupivli', 'suppliers', 'finansova-zvitnist', 'smachna_robota',
-                    'experience-of-your-future', 'rasprodazha', 'tovari-dlya-grizuniv',
-                    'tovari-dlya-ptahiv', 'tovari-dlya-kotiv', 'tovari-dlya-ryb', 'akvariumistika',
-                    'varuscafe', 'vigidni-propozitsiyi', 'kuhonni-priladdya', 'tovari-dlya-domu'
-                ]
-
-                use_fast_mode = any(prob in full_url for prob in problematic_pages)
-                timeout = 8000 if use_fast_mode else 12000
-
-                yield Request(
-                    full_url,
-                    callback=self.parse_category_page,
-                    meta={
-                        'playwright': True,
-                        'playwright_wait_for_timeout': timeout,
-                        'playwright_page_methods': self.get_page_methods(fast_mode=use_fast_mode)
-                    }
-                )
-
-        self.logger.info(f"Following {category_count} category URLs")
-    
-    def parse_category_page(self, response):
-        """Parse products from category page"""
-        self.logger.info(f"Parsing category page: {response.url}")
-        # Reuse the same parsing logic as search results
-        yield from self.parse_search_results(response)
-    
-    
-    def extract_category_info(self, response):
-        """Extract category information from breadcrumbs or URL"""
-        category_info = {}
-
-        try:
-            # First try to get category from breadcrumbs - Silpo specific selector
-            breadcrumb_selectors = [
-                '.breadcrumbs-list__item.breadcrumbs-list__item--active.ng-star-inserted::text',
-                '.breadcrumbs a::text',
-                '.breadcrumb a::text',
-                'nav.breadcrumbs a::text',
-                '[class*="breadcrumb"] a::text'
-            ]
-
-            breadcrumbs = []
-            for selector in breadcrumb_selectors:
-                breadcrumbs = response.css(selector).getall()
-                if breadcrumbs:
-                    break
-
-            if breadcrumbs:
-                # Clean and filter breadcrumbs
-                valid_crumbs = []
-                for crumb in breadcrumbs:
-                    crumb = crumb.strip()
-                    if crumb and crumb.lower() not in ['home', 'головна', 'silpo', 'сільпо', '']:
-                        valid_crumbs.append(crumb)
-
-                if valid_crumbs:
-                    # Take the last two as category and subcategory
-                    if len(valid_crumbs) >= 2:
-                        category_info['category'] = valid_crumbs[-2]
-                        category_info['subcategory'] = valid_crumbs[-1]
-                    else:
-                        category_info['category'] = valid_crumbs[-1]
-
-            # If no breadcrumbs, try to extract from URL
-            if not category_info:
-                # Clean URL by removing query parameters first
-                clean_url = response.url.split('?')[0]
-                url_parts = clean_url.split('/')
-                # Remove empty parts and domain
-                url_parts = [p for p in url_parts[3:] if p]
-
-                if url_parts:
-                    # Decode URL encoded parts
-                    from urllib.parse import unquote
-                    url_parts = [unquote(p) for p in url_parts]
-
-                    # Convert URL slug to readable format
-                    if url_parts:
-                        category_name = url_parts[-1].replace('-', ' ').title()
-                        category_info['category'] = category_name
-
-                        if len(url_parts) > 1:
-                            parent_category = url_parts[-2].replace('-', ' ').title()
-                            category_info['subcategory'] = category_name
-                            category_info['category'] = parent_category
-
-            # Always include the category URL for reference
-            category_info['category_url'] = response.url
-
-        except (AttributeError, IndexError, ValueError, KeyError) as e:
-            self.logger.error(f"Error extracting category: {e}")
-
-        return category_info
-    
-    def extract_price(self, price_text):
-        """Extract numeric price from text"""
-        if not price_text:
-            return None
-
-        # Remove thousand separators (spaces) but keep decimal points
-        price_text = price_text.replace(' ', '')
-
-        # Find all price patterns (digits with optional decimal point)
-        price_patterns = re.findall(r'(\d+(?:\.\d+)?)', price_text)
-
-        if price_patterns:
-            # Get the last price (usually the current/discounted price)
-            last_price = price_patterns[-1]
-            try:
-                return float(last_price)
-            except ValueError:
-                self.logger.warning(f"Could not convert price to float: {last_price}")
-                return None
-
-        return None
-    
-    def errback(self, failure: Any) -> None:
-        # Ignore errors for non-essential URLs
-        ignore_patterns = ['/novelty', '/new', '/sale', '/discount', '/action', '/special', '/promotion', '/own-tm',
-                           '/optovi-zakupivli', '/suppliers', '/finansova-zvitnist', '/smachna_robota',
-                           '/experience-of-your-future',
-                           '/rasprodazha', '/varuscafe', '/vigidni-propozitsiyi-vid-bankiv', '/tenders', '/advertisers',
-                           '/partners', '/business', '/biznes', '/shvydka-dostavka', '/dostavka-dlya', '/optom',
-                           '/wholesale', '/corporate', '/b2b', '/franchise', '/career', '/vacancy']
-        if any(pattern in failure.request.url for pattern in ignore_patterns):
-            return
-
-        # Log the error and add to failed URLs for tracking
-        error_type = type(failure.value).__name__
-        url = failure.request.url
-        
-        self.logger.error(f"Request failed: {url}")
-        self.logger.error(f"Error: {error_type} - {failure.value}")
-        
-        # Track failed URLs for final reporting
-        self.failed_urls.add(url)
-    
-    def closed(self):
-        """Called when spider is closed - do final retry of failed URLs"""
-        if self.failed_urls:
-            self.logger.info(f"Spider closed. {len(self.failed_urls)} URLs failed after all retries:")
-            for url in self.failed_urls:
-                self.logger.info(f"  - {url}")
-            
-            # You can uncomment this to enable automatic final retry
-            # self.logger.info("Starting final retry phase...")
-            # for url in self.failed_urls:
-            #     yield Request(
-            #         url=url,
-            #         callback=self.parse_search_results,
-            #         meta={
-            #             'playwright': True,
-            #             'playwright_wait_for_timeout': 60000,  # Maximum timeout
-            #             'playwright_page_methods': [
-            #                 PageMethod('wait_for_load_state', 'networkidle'),  # Wait for network idle
-            #                 PageMethod('wait_for_timeout', 5000),  # Extra wait
-            #             ] + self.get_page_methods(fast_mode=True),
-            #             'final_retry': True
-            #         },
-            #         dont_filter=True,
-            #         priority=1
-            #     )
-        else:
-            self.logger.info("Spider completed successfully with no failed URLs!")
+                        yield self.make_request(
+                            page_url,
+                            callback=self.parse_category,
+                            meta={'category_name': category_name, 'page': page_num}
+                        )
