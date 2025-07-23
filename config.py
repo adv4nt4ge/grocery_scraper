@@ -3,7 +3,7 @@ Simple configuration file for the grocery scraper.
 """
 
 # Database
-DATABASE_PATH = "/Users/dkovtunov/shared/grocery_data.db"
+DATABASE_PATH = "grocery_data.db"
 
 # Store configurations
 STORES = {
@@ -80,11 +80,7 @@ EXCLUDED_URL_PATTERNS = {
         "zdorove-kharchuvannia-4864"
     ],
 
-    "atb": [
-        # Add ATB-specific URL patterns to exclude
-    ],
-
     "metro": [
-        # Add Metro-specific URL patterns to exclude
+        "special-offers-metro",
     ],
 }

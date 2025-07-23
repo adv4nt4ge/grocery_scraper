@@ -174,7 +174,7 @@ DOWNLOAD_MAXSIZE = 10485760
 DOWNLOAD_WARNSIZE = 5242880
 
 # Database settings
-DATABASE_URL = 'sqlite:////Users/dkovtunov/shared/grocery_data.db'
+DATABASE_URL = 'sqlite:///grocery_data.db'
 DATABASE_CONNECTION_SETTINGS = {
     'check_same_thread': False,
     'timeout': 30,

@@ -225,6 +225,19 @@ class BaseGrocerySpider(scrapy.Spider):
                 from ..utils import init_page_with_blocking
                 request_meta['playwright_page_init_callback'] = init_page_with_blocking
 
+            # Add default page methods if not specified
+            if 'playwright_page_methods' not in request_meta:
+                from scrapy_playwright.page import PageMethod
+                request_meta['playwright_page_methods'] = [
+                    PageMethod('wait_for_load_state', 'domcontentloaded'),
+                    PageMethod('wait_for_timeout', 300),
+                    PageMethod('wait_for_function', self.get_wait_function(), timeout=5000),
+                ]
+
+        # Add errback to ensure page cleanup
+        if 'errback' not in kwargs:
+            kwargs['errback'] = self.close_page_on_error
+
         return Request(
             url=url,
             callback=callback,
@@ -232,16 +245,79 @@ class BaseGrocerySpider(scrapy.Spider):
             **kwargs
         )
 
+    def get_wait_function(self) -> str:
+        """Get JavaScript wait function for page loading. Override in subclasses."""
+        return '''() => {
+            const hasProducts = document.querySelectorAll('[data-testid="product-tile"], [data-autotestid="shop-silpo-product-card"], .sf-product-card').length > 0;
+            const hasCategories = document.querySelectorAll('a[href*="/categories/"], a[data-autotestid="ssr-menu-categories__link"], .a-megamenu-item a').length > 0;
+            const hasContent = document.body.innerText.length > 100;
+            const isEmpty = document.querySelector('.empty-results') !== null;
+            return hasProducts || hasCategories || hasContent || isEmpty || document.readyState === 'complete';
+        }'''
+
+    async def close_page_on_error(self, failure):
+        """Close Playwright page on request failure."""
+        page = failure.request.meta.get('playwright_page')
+        if page:
+            await page.close()
+            self.logger.info(f"[{self.store_name.upper()}] Closed page due to error: {failure.value}")
+
+    def get_category_url_from_db(self, category_name: str) -> Optional[str]:
+        """Get category URL from database by name."""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT category_url
+                FROM categories
+                WHERE store = ?
+                  AND category LIKE ?
+            ''', (self.store_name, f'%{category_name}%'))
+            result = cursor.fetchone()
+            return result[0] if result else None
+        except Exception as e:
+            self.logger.error(f"Error querying database: {e}")
+            return None
+        finally:
+            conn.close()
+
     def parse(self, response: Response):
         """Default parse method - handles category discovery mode."""
+        # Check if we have a specific category to scrape
+        category_name = getattr(self, 'category_name', None)
+        start_url = getattr(self, 'start_url', None)
+        
+        # If we have a specific category name, only scrape that category
+        if category_name:
+            self.logger.info(f"Scraping specific category: {category_name}")
+            # If we have a direct category URL, parse it directly
+            if start_url and start_url != response.url:
+                yield self.make_request(
+                    start_url,
+                    callback=self.parse_category,
+                    meta={'category_name': category_name, 'page': 1}
+                )
+                return
+            else:
+                # Try to parse the current page as a category page
+                yield from self.parse_category(response)
+                return
+
         # If in discovery mode, only discover categories and exit
         if self.discover_categories_mode:
             self.logger.info(f"[{self.store_name.upper()}] Running in category discovery mode")
             yield from self.discover_categories(response)
             return
 
-        # Otherwise, subclasses should implement their own parse logic
-        raise NotImplementedError("Subclasses must implement parse method for product scraping")
+        # Otherwise, check if we should load from DB or discover
+        categories_exist = self.check_categories_in_db()
+
+        if categories_exist:
+            self.logger.info("Loading categories from database")
+            yield from self.parse_all_categories_from_db()
+        else:
+            self.logger.info("No categories in database, starting category discovery")
+            yield from self.discover_categories(response)
 
     def check_categories_in_db(self) -> bool:
         """Check if categories exist in the database."""
@@ -386,8 +462,198 @@ class BaseGrocerySpider(scrapy.Spider):
             conn.close()
 
     def parse_category(self, response: Response):
-        """Parse category page - should be overridden by subclasses."""
-        raise NotImplementedError("Subclasses must implement parse_category method")
+        """Parse category page and extract products."""
+        category_name = response.meta.get('category_name') or getattr(self, 'category_name', None) or 'Unknown'
+        page = response.meta.get('page', 1)
+
+        self.logger.info(f"[{self.store_name.upper()}] Parsing category: {category_name} (page {page})")
+        self.logger.info(f"[{self.store_name.upper()}] Response URL: {response.url}")
+        self.logger.info(f"[{self.store_name.upper()}] Response status: {response.status}")
+        self.logger.info(f"[{self.store_name.upper()}] Response size: {len(response.text)} chars")
+
+        # Extract products using selectors
+        product_cards = self.get_product_cards(response)
+        products_found = 0
+        self.logger.info(f"[{self.store_name.upper()}] Total product cards found: {len(product_cards)}")
+
+        for card in product_cards:
+            product = self.extract_product(card, response, category_name)
+            if product:
+                self.save_product(product)
+                yield product
+                products_found += 1
+
+        self.logger.info(f"[{self.store_name.upper()}] Found {products_found} products on page {page}")
+
+        # Close Playwright page if included
+        yield from self.close_page_if_needed(response)
+
+        # Handle pagination if on first page
+        if page == 1:
+            yield from self.handle_pagination(response, category_name)
+
+    def get_product_cards(self, response: Response):
+        """Get product cards from response. Override in subclasses if needed."""
+        product_cards = []
+        if isinstance(self.product_card_selector, list):
+            for selector in self.product_card_selector:
+                cards = response.css(selector)
+                product_cards.extend(cards)
+                self.logger.info(f"[{self.store_name.upper()}] Found {len(cards)} cards with selector: {selector}")
+        else:
+            product_cards = response.css(self.product_card_selector)
+            self.logger.info(f"[{self.store_name.upper()}] Found {len(product_cards)} cards with selector: {self.product_card_selector}")
+        return product_cards
+
+    def extract_product(self, card, response: Response, category_name: str) -> Optional[Dict[str, Any]]:
+        """Extract product data from product card."""
+        # Product name
+        name = card.css(f'{self.product_title_selector}::text').get()
+        if not name and hasattr(self, 'product_title_alt_selector'):
+            name = card.css(f'{self.product_title_alt_selector}::text').get()
+        if not name:
+            name = card.css('::attr(title)').get()
+        name = self.clean_text(name)
+
+        # Product price
+        price = self.extract_price_from_card(card)
+        if not price:
+            return None
+
+        # Product URL
+        product_url = self.extract_url_from_card(card, response)
+
+        # Extract image URL
+        image_url = self.extract_image_url_from_card(card, response)
+
+        # Extract category and subcategory from breadcrumbs if available
+        category, subcategory = self.extract_category_from_breadcrumbs(response)
+        if not category:
+            category = category_name
+
+        return {
+            'name': name,
+            'price': price,
+            'category': category,
+            'subcategory': subcategory,
+            'store': self.store_name,
+            'url': product_url,
+            'image_url': image_url,
+        }
+
+    def extract_price_from_card(self, card) -> Optional[float]:
+        """Extract price from product card."""
+        price_text = None
+        if isinstance(self.product_price_selectors, list):
+            for price_selector in self.product_price_selectors:
+                price_text = card.css(f'{price_selector}::text').get()
+                if price_text:
+                    break
+        else:
+            price_text = card.css(f'{self.product_price_selectors}::text').get()
+        return self.clean_price(price_text)
+
+    def extract_url_from_card(self, card, response: Response) -> Optional[str]:
+        """Extract product URL from card."""
+        product_url = None
+        if self.product_link_selector:
+            product_url = card.css(f'{self.product_link_selector}::attr(href)').get()
+        else:
+            # Card itself might be a link
+            product_url = card.css('::attr(href)').get()
+        
+        if product_url:
+            product_url = urljoin(response.url, product_url)
+        return product_url
+
+    def extract_image_url_from_card(self, card, response: Response) -> Optional[str]:
+        """Extract image URL from card."""
+        image_url = card.css('[data-autotestid="img"]::attr(src)').get()
+        if not image_url:
+            image_url = card.css('img::attr(src)').get()
+        if not image_url:
+            image_url = card.css('img::attr(data-src)').get()
+        if image_url:
+            image_url = urljoin(response.url, image_url)
+        return image_url
+
+    def close_page_if_needed(self, response: Response):
+        """Close Playwright page if included."""
+        page_obj = response.meta.get('playwright_page')
+        if page_obj:
+            import asyncio
+            asyncio.create_task(page_obj.close())
+            self.logger.debug(f"[{self.store_name.upper()}] Scheduled page close for {response.url}")
+        return []
+
+    def handle_pagination(self, response: Response, category_name: str):
+        """Handle pagination for categories."""
+        # Get pagination block
+        pag_block = response.css(self.pagination_selector)
+
+        if pag_block:
+            # Look for pagination items
+            pagination_items = self.get_pagination_items(pag_block)
+
+            if pagination_items:
+                page_numbers = self.extract_page_numbers(pagination_items)
+
+                if page_numbers:
+                    last_page_num = max(page_numbers)
+                    self.logger.info(f"Found {last_page_num} total pages for {category_name}")
+
+                    # Generate requests for remaining pages
+                    for page_num in range(2, last_page_num + 1):
+                        page_url = self.build_page_url(response.url, page_num)
+                        yield self.make_request(
+                            page_url,
+                            callback=self.parse_category,
+                            meta={'category_name': category_name, 'page': page_num}
+                        )
+
+    def get_pagination_items(self, pag_block):
+        """Get pagination items from pagination block. Override if needed."""
+        # Try common pagination patterns
+        items = pag_block.css('.pagination-item.ng-star-inserted, .pagination-item')
+        if not items:
+            items = pag_block.css('.Pagination__item')
+        if not items and self.store_name.lower() == 'varus':
+            # Varus specific pagination
+            last_page_element = pag_block.css('[data-transaction-name="Pagination - Go To Last"]')
+            return last_page_element
+        return items
+
+    def extract_page_numbers(self, pagination_items):
+        """Extract page numbers from pagination items."""
+        page_numbers = []
+        
+        # Special case for Varus "Go To Last" button
+        if (len(pagination_items) == 1 and 
+            pagination_items[0].css('::attr(href)').get() and 
+            'page=' in pagination_items[0].css('::attr(href)').get()):
+            
+            last_page_url = pagination_items[0].css('::attr(href)').get()
+            page_match = re.search(r'[?&]page=(\d+)', last_page_url)
+            if page_match:
+                return [int(page_match.group(1))]
+        
+        # Standard pagination items
+        for item in pagination_items:
+            page_text = item.css('a::text').get()
+            if not page_text:
+                page_text = item.css('::text').get()
+            if page_text and page_text.strip().isdigit():
+                page_numbers.append(int(page_text.strip()))
+        
+        return page_numbers
+
+    def build_page_url(self, current_url: str, page_num: int) -> str:
+        """Build URL for specific page number."""
+        if '?page=' in current_url:
+            return re.sub(r'page=\d+', f'page={page_num}', current_url)
+        else:
+            separator = '&' if '?' in current_url else '?'
+            return f"{current_url}{separator}page={page_num}"
 
     def is_category_excluded(self, category: str, subcategory: str = None, url: str = None) -> bool:
         """Check if a URL should be excluded based on URL patterns."""
