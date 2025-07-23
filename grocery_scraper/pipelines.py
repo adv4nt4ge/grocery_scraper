@@ -3,7 +3,12 @@
 Enhanced Scrapy pipelines with improved error handling and data validation.
 """
 
+import hashlib
+import logging
+import os
 import re
+import sqlite3
+import sys
 from datetime import datetime
 from typing import Dict, Any, Set
 
@@ -11,13 +16,6 @@ from itemadapter import ItemAdapter
 from scrapy import Spider
 from scrapy.exceptions import DropItem
 
-import sqlite3
-import hashlib
-import logging
-from urllib.parse import urlparse
-
-import sys
-import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from config import DATABASE_PATH
 

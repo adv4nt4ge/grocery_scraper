@@ -3,14 +3,15 @@
 Scrapy Items with validation and serialization for grocery scraper.
 """
 
+# Simple utility functions (avoid external dependencies)
+import re
+from datetime import datetime
+from typing import Optional, Union, List, Tuple
+
 import scrapy
 from itemloaders.processors import TakeFirst, MapCompose
 from scrapy.loader import ItemLoader
-from typing import Optional, Union, Any, Dict, List, Tuple
-from datetime import datetime
 
-# Simple utility functions (avoid external dependencies)
-import re
 
 def clean_text(text):
     if not text:
