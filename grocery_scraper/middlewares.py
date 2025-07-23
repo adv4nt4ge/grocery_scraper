@@ -1,15 +1,9 @@
-# Define here the models for your spider middleware
-#
-# See documentation in:
-# https://docs.scrapy.org/en/latest/topics/spider-middleware.html
-
-from scrapy import signals
-from scrapy.http import HtmlResponse
-from scrapy.exceptions import NotConfigured
-from playwright.sync_api import sync_playwright
 import logging
-import asyncio
-from urllib.parse import urljoin
+
+from playwright.sync_api import sync_playwright
+from scrapy import signals
+from scrapy.exceptions import NotConfigured
+from scrapy.http import HtmlResponse
 
 
 class PlaywrightMiddleware:
