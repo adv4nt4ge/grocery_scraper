@@ -20,7 +20,6 @@ ENV/
 *.log
 
 # Database (keep grocery_data.db but ignore others)
-scraper.sqlite
 *.sqlite3
 
 # Output files
