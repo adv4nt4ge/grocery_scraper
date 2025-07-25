@@ -19,6 +19,13 @@ from scrapy.exceptions import DropItem
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from config import DATABASE_PATH
 
+try:
+    from elasticsearch_config import es_manager
+    ELASTICSEARCH_AVAILABLE = True
+except ImportError:
+    ELASTICSEARCH_AVAILABLE = False
+    es_manager = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -514,10 +521,149 @@ class PriceAnalysisPipeline:
             )
 
 
+class ElasticsearchPipeline:
+    """Pipeline for indexing products to Elasticsearch in real-time."""
+    
+    def __init__(self):
+        self.items_processed = 0
+        self.items_indexed = 0
+        self.items_failed = 0
+        self.batch_size = 50  # Smaller batches for real-time indexing
+        self.batch_items = []
+        self.enabled = ELASTICSEARCH_AVAILABLE
+        
+        if not self.enabled:
+            logger.warning("Elasticsearch not available - ElasticsearchPipeline disabled")
+    
+    def open_spider(self, spider: Spider) -> None:
+        """Initialize Elasticsearch index when spider starts."""
+        if not self.enabled:
+            return
+            
+        try:
+            # Create index if it doesn't exist
+            if es_manager.create_index(delete_existing=False):
+                spider.logger.info("Elasticsearch index ready for real-time indexing")
+            else:
+                spider.logger.warning("Failed to initialize Elasticsearch index")
+                self.enabled = False
+        except Exception as e:
+            spider.logger.error(f"Elasticsearch initialization error: {e}")
+            self.enabled = False
+    
+    def process_item(self, item: Dict[str, Any], spider: Spider) -> Dict[str, Any]:
+        """Process item and add to batch for Elasticsearch indexing."""
+        if not self.enabled:
+            return item
+            
+        self.items_processed += 1
+        self.batch_items.append(item)
+        
+        # Process batch when it reaches the specified size
+        if len(self.batch_items) >= self.batch_size:
+            self._process_batch(spider)
+        
+        return item
+    
+    def close_spider(self, spider: Spider) -> None:
+        """Process remaining items and log statistics."""
+        if not self.enabled:
+            return
+            
+        if self.batch_items:
+            self._process_batch(spider)
+        
+        spider.logger.info(
+            f"Elasticsearch pipeline complete. "
+            f"Processed: {self.items_processed}, "
+            f"Indexed: {self.items_indexed}, "
+            f"Failed: {self.items_failed}"
+        )
+    
+    def _process_batch(self, spider: Spider) -> None:
+        """Process a batch of items for Elasticsearch indexing."""
+        if not self.batch_items or not self.enabled:
+            return
+        
+        try:
+            # Convert items to Elasticsearch documents
+            es_docs = []
+            for item in self.batch_items:
+                try:
+                    es_doc = self._convert_to_es_document(item)
+                    es_docs.append(es_doc)
+                except Exception as e:
+                    self.items_failed += 1
+                    spider.logger.error(f"Error converting item to ES document: {e}")
+            
+            # Bulk index documents
+            if es_docs:
+                indexed_count, failed = es_manager.bulk_index_products(es_docs)
+                self.items_indexed += indexed_count
+                self.items_failed += len(failed)
+                
+                spider.logger.debug(f"Indexed batch of {indexed_count} products to Elasticsearch")
+            
+        except Exception as e:
+            self.items_failed += len(self.batch_items)
+            spider.logger.error(f"Error processing Elasticsearch batch: {e}")
+        
+        finally:
+            self.batch_items.clear()
+    
+    def _convert_to_es_document(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert Scrapy item to Elasticsearch document."""
+        adapter = ItemAdapter(item)
+        
+        # Generate product_id if not present
+        if not adapter.get('product_id'):
+            store = adapter.get('store', '')
+            url = adapter.get('url', '')
+            if store and url:
+                import hashlib
+                adapter['product_id'] = hashlib.md5(f"{store}:{url}".encode()).hexdigest()
+        
+        # Convert to Elasticsearch document format
+        doc = {
+            # Core fields
+            'product_id': adapter.get('product_id'),
+            'name': adapter.get('name'),
+            'price': float(adapter.get('price', 0)) if adapter.get('price') else 0.0,
+            'store': adapter.get('store'),
+            'category': adapter.get('category'),
+            'subcategory': adapter.get('subcategory'),
+            'url': adapter.get('url'),
+            
+            # Extended fields
+            'brand': adapter.get('brand'),
+            'description': adapter.get('description'),
+            'image_url': adapter.get('image_url'),
+            'original_price': float(adapter.get('original_price', 0)) if adapter.get('original_price') else None,
+            'discount_percentage': float(adapter.get('discount_percentage', 0)) if adapter.get('discount_percentage') else 0.0,
+            'discount_amount': float(adapter.get('discount_amount', 0)) if adapter.get('discount_amount') else None,
+            'unit_price': float(adapter.get('unit_price', 0)) if adapter.get('unit_price') else None,
+            'rating': float(adapter.get('rating', 0)) if adapter.get('rating') else None,
+            'reviews_count': int(adapter.get('reviews_count', 0)) if adapter.get('reviews_count') else 0,
+            'availability': adapter.get('availability', 'unknown'),
+            'stock_quantity': int(adapter.get('stock_quantity', 0)) if adapter.get('stock_quantity') else None,
+            'promo_tags': adapter.get('promo_tags'),
+            'store_category': adapter.get('store_category'),
+            'store_subcategory': adapter.get('store_subcategory'),
+            
+            # Timestamps
+            'scraped_at': adapter.get('scraped_at'),
+            'created_at': adapter.get('scraped_at'),
+        }
+        
+        # Remove None values to keep the document clean
+        return {k: v for k, v in doc.items() if v is not None}
+
+
 # Pipeline configuration for settings.py
 ITEM_PIPELINES = {
     'grocery_scraper.pipelines.ValidationPipeline': 100,
     'grocery_scraper.pipelines.DeduplicationPipeline': 200,
     'grocery_scraper.pipelines.DatabasePipeline': 300,
+    'grocery_scraper.pipelines.ElasticsearchPipeline': 350,  # Index to ES after DB
     'grocery_scraper.pipelines.PriceAnalysisPipeline': 400,
 }
