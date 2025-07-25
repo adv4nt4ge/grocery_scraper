@@ -12,15 +12,15 @@ ENV/
 # IDE
 .idea/
 .vscode/
-*.sublime-project
-*.sublime-workspace
 
 # Scrapy
 .scrapy/
 *.log
 
-# Database (keep grocery_data.db but ignore others)
+# Database
 *.sqlite3
+*.db-wal
+*.db-shm
 
 # Output files
 *.json
